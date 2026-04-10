@@ -3,21 +3,19 @@ FunReserve 潜店信息提取工具
 用法：streamlit run app.py
 """
 
-import re
 import streamlit as st
 import httpx
-from openai import OpenAI
+import json
 
 OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
 
-# ─── 字段结构提示词 ───────────────────────────────────────────────
 PROMPT_TEMPLATE = """你是FunReserve潜水预订平台的潜店信息录入助手。
-以下是从该潜水店各个页面抓取到的原始网页内容，请根据这些内容提取信息，严格按照字段结构输出。
+请访问以下链接，抓取该潜水店的所有公开信息，严格按照下方字段结构输出。
 找不到的字段统一标注【待补充】，绝对不要编造任何信息。
 
-{content}
+{links}
 
-请按以下结构输出，每个字段单独一行：
+请按以下结构输出：
 
 ## 一、基础信息
 - 潜店名称：
@@ -107,36 +105,22 @@ MISSING: 字段名称
 """
 
 
-def fetch_page(url: str) -> str:
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
-    try:
-        resp = httpx.get(url, headers=headers, timeout=15, follow_redirects=True)
-        resp.raise_for_status()
-        text = re.sub(r"<style[^>]*>.*?</style>", " ", resp.text, flags=re.DOTALL)
-        text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.DOTALL)
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = re.sub(r"\s+", " ", text).strip()
-        return text[:8000]
-    except Exception as e:
-        return f"[无法访问 {url}：{e}]"
+def build_links_text(website, instagram="", facebook="", google_maps="", tripadvisor=""):
+    lines = []
+    if website:
+        lines.append(f"潜店网址：{website}")
+    if google_maps:
+        lines.append(f"Google Maps：{google_maps}")
+    if instagram:
+        lines.append(f"Instagram：{instagram}")
+    if facebook:
+        lines.append(f"Facebook：{facebook}")
+    if tripadvisor:
+        lines.append(f"TripAdvisor：{tripadvisor}")
+    return "\n".join(lines)
 
 
-def fetch_all_content(website, instagram="", facebook="", google_maps="", tripadvisor="") -> str:
-    parts = []
-    urls = {
-        "官网": website,
-        "Instagram": instagram,
-        "Facebook": facebook,
-        "Google Maps": google_maps,
-        "TripAdvisor": tripadvisor,
-    }
-    for label, url in urls.items():
-        if url:
-            parts.append(f"=== {label}：{url} ===\n{fetch_page(url)}")
-    return "\n\n".join(parts)
-
-
-def extract_missing_fields(content: str) -> list[str]:
+def extract_missing_fields(content: str) -> list:
     missing = []
     for line in content.splitlines():
         line = line.strip()
@@ -147,29 +131,49 @@ def extract_missing_fields(content: str) -> list[str]:
     return missing
 
 
-def call_claude(web_content: str):
-    client = OpenAI(
-        api_key=OPENROUTER_API_KEY,
-        base_url="https://openrouter.ai/api/v1",
-    )
-    prompt = PROMPT_TEMPLATE.format(content=web_content)
-    stream = client.chat.completions.create(
-        model="anthropic/claude-sonnet-4-5",
-        max_tokens=4000,
-        stream=True,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    for chunk in stream:
-        delta = chunk.choices[0].delta.content
-        if delta:
-            yield delta
+def call_claude_with_search(links_text: str):
+    """调用OpenRouter的Claude，使用web search插件读取网页"""
+    prompt = PROMPT_TEMPLATE.format(links=links_text)
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://funreserve.com",
+        "X-Title": "FunReserve Dive Shop Tool",
+    }
+
+    payload = {
+        "model": "anthropic/claude-sonnet-4-5",
+        "max_tokens": 4000,
+        "stream": True,
+        "plugins": [{"id": "web"}],  # 开启web搜索插件
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    with httpx.stream(
+        "POST",
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=120,
+    ) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if line.startswith("data: ") and line != "data: [DONE]":
+                try:
+                    data = json.loads(line[6:])
+                    delta = data["choices"][0]["delta"].get("content", "")
+                    if delta:
+                        yield delta
+                except Exception:
+                    continue
 
 
 # ─── UI ──────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="FunReserve 潜店信息提取", layout="wide")
 st.title("🤿 FunReserve 潜店信息提取工具")
-st.caption("输入潜店链接，AI 自动抓取并整理所有字段，标注待补充项。")
+st.caption("输入潜店链接，AI 自动读取网页并整理所有字段，标注待补充项。")
 
 with st.form("input_form"):
     st.subheader("输入潜店链接")
@@ -191,15 +195,13 @@ if submitted:
         st.divider()
         st.subheader("分析结果")
 
-        with st.spinner("正在抓取网页内容..."):
-            web_content = fetch_all_content(website, instagram, facebook, google_maps, tripadvisor)
-
+        links_text = build_links_text(website, instagram, facebook, google_maps, tripadvisor)
         result_placeholder = st.empty()
         full_content = ""
 
-        with st.spinner("AI 正在分析，请稍候..."):
+        with st.spinner("AI 正在读取网页并分析，请稍候（约1-2分钟）..."):
             try:
-                for chunk in call_claude(web_content):
+                for chunk in call_claude_with_search(links_text):
                     full_content += chunk
                     result_placeholder.markdown(full_content)
             except Exception as e:
@@ -214,12 +216,12 @@ if submitted:
             for field in missing:
                 st.markdown(f"- [ ] {field}")
         else:
-            st.success("所有字段均已获取，无需补充！")
+            st.success("所有字段均已获取！")
 
         st.divider()
         st.download_button(
             label="下载结果（Markdown）",
             data=full_content,
-            file_name=f"{website.replace('https://', '').replace('http://', '').split('/')[0]}.md",
+            file_name=f"{website.replace('https://','').replace('http://','').split('/')[0]}.md",
             mime="text/markdown",
         )
