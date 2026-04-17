@@ -10,7 +10,7 @@ import json
 OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
 
 PROMPT_TEMPLATE = """你是FunReserve潜水预订平台的潜店信息录入助手。
-请访问以下链接，抓取该潜水店的所有公开信息，严格按照下方字段结构输出。
+以下是从该潜水店各页面抓取到的原始内容，请根据这些内容提取信息，严格按照字段结构输出。
 找不到的字段统一标注【待补充】，绝对不要编造任何信息。
 
 {links}
@@ -105,19 +105,31 @@ MISSING: 字段名称
 """
 
 
-def build_links_text(website, instagram="", facebook="", google_maps="", tripadvisor=""):
-    lines = []
-    if website:
-        lines.append(f"潜店网址：{website}")
-    if google_maps:
-        lines.append(f"Google Maps：{google_maps}")
-    if instagram:
-        lines.append(f"Instagram：{instagram}")
-    if facebook:
-        lines.append(f"Facebook：{facebook}")
-    if tripadvisor:
-        lines.append(f"TripAdvisor：{tripadvisor}")
-    return "\n".join(lines)
+def fetch_page(url: str) -> str:
+    """用 Jina Reader 抓取网页，返回干净的文本内容"""
+    jina_url = f"https://r.jina.ai/{url}"
+    headers = {"Accept": "text/plain", "X-Timeout": "20"}
+    try:
+        resp = httpx.get(jina_url, headers=headers, timeout=30, follow_redirects=True)
+        resp.raise_for_status()
+        return resp.text[:8000]
+    except Exception as e:
+        return f"[无法访问 {url}：{e}]"
+
+
+def fetch_all_content(website, instagram="", facebook="", google_maps="", tripadvisor="") -> str:
+    parts = []
+    urls = {
+        "官网": website,
+        "Instagram": instagram,
+        "Facebook": facebook,
+        "Google Maps": google_maps,
+        "TripAdvisor": tripadvisor,
+    }
+    for label, url in urls.items():
+        if url:
+            parts.append(f"=== {label}：{url} ===\n{fetch_page(url)}")
+    return "\n\n".join(parts)
 
 
 def extract_missing_fields(content: str) -> list:
@@ -131,9 +143,9 @@ def extract_missing_fields(content: str) -> list:
     return missing
 
 
-def call_claude_with_search(links_text: str):
-    """调用OpenRouter的Claude，使用web search插件读取网页"""
-    prompt = PROMPT_TEMPLATE.format(links=links_text)
+def call_claude(web_content: str):
+    """把抓取到的网页内容发给 Claude 分析"""
+    prompt = PROMPT_TEMPLATE.format(content=web_content)
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -146,7 +158,6 @@ def call_claude_with_search(links_text: str):
         "model": "anthropic/claude-sonnet-4-5",
         "max_tokens": 4000,
         "stream": True,
-        "plugins": [{"id": "web"}],  # 开启web搜索插件
         "messages": [{"role": "user", "content": prompt}],
     }
 
@@ -195,13 +206,15 @@ if submitted:
         st.divider()
         st.subheader("分析结果")
 
-        links_text = build_links_text(website, instagram, facebook, google_maps, tripadvisor)
         result_placeholder = st.empty()
         full_content = ""
 
-        with st.spinner("AI 正在读取网页并分析，请稍候（约1-2分钟）..."):
+        with st.spinner("正在抓取网页内容..."):
+            web_content = fetch_all_content(website, instagram, facebook, google_maps, tripadvisor)
+
+        with st.spinner("AI 正在分析，请稍候..."):
             try:
-                for chunk in call_claude_with_search(links_text):
+                for chunk in call_claude(web_content):
                     full_content += chunk
                     result_placeholder.markdown(full_content)
             except Exception as e:
